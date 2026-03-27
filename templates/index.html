@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PulseFetch – SFTP File Explorer</title>
+
+  <!-- Bootstrap 5 (CDN — no installation needed) -->
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+        crossorigin="anonymous">
+  <!-- Bootstrap Icons -->
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
+
+  <style>
+    /* ── Layout ──────────────────────────────────────────────────────── */
+    body { padding-bottom: 220px; }   /* reserve space for the docked panel */
+
+    /* ── File table ──────────────────────────────────────────────────── */
+    .file-table td, .file-table th { vertical-align: middle; }
+    .file-name-cell { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .folder-link    { color: #6ea8fe; font-weight: 500; }
+    .folder-link:hover { color: #9ec5fe; text-decoration: underline; }
+
+    /* ── Downloads panel (docked to bottom) ──────────────────────────── */
+    #downloads-panel {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      background: #1a1d21; border-top: 2px solid #375a7f;
+      z-index: 1040; transition: height 0.25s ease;
+      max-height: 220px; overflow-y: auto;
+    }
+    #downloads-panel.collapsed { max-height: 42px; overflow: hidden; }
+    #panel-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 6px 16px; background: #212529; cursor: pointer;
+      border-bottom: 1px solid #375a7f; user-select: none;
+    }
+    .job-card  { font-size: 0.82rem; }
+    .job-fname { font-weight: 600; max-width: 38ch; overflow: hidden;
+                 text-overflow: ellipsis; white-space: nowrap; }
+
+    /* ── Status badge colours ─────────────────────────────────────────── */
+    .badge-starting    { background-color: #6c757d; }
+    .badge-downloading { background-color: #0d6efd; }
+    .badge-pausing     { background-color: #ffc107; color: #000; }
+    .badge-retrying    { background-color: #dc3545; }
+    .badge-complete    { background-color: #198754; }
+    .badge-error       { background-color: #dc3545; }
+    .badge-cancelled   { background-color: #6c757d; }
+
+    /* ── Misc ────────────────────────────────────────────────────────── */
+    .navbar-brand span { font-size: 0.75rem; opacity: 0.7; }
+    .progress { border-radius: 4px; }
+    .entry-row:hover .dl-btn { opacity: 1; }
+    .dl-btn { opacity: 0.7; transition: opacity 0.15s; }
+  </style>
+</head>
+
+<body>
+
+<!-- ═══════════════════════════════════════  NAVBAR  ═══════════════════════ -->
+<nav class="navbar navbar-dark bg-dark border-bottom border-secondary px-3">
+  <a class="navbar-brand d-flex align-items-center gap-2" href="/">
+    <i class="bi bi-broadcast-pin fs-5 text-info"></i>
+    <strong>PulseFetch</strong>
+    <span>SFTP {{ sftp_host }}:{{ sftp_port }}
+      &nbsp;·&nbsp; {{ chunk_mb }} MB chunks
+      &nbsp;·&nbsp; {{ sleep_secs }}s cooldown</span>
+  </a>
+  <a href="{{ download_dir }}" class="btn btn-sm btn-outline-secondary"
+     title="Open download folder">
+    <i class="bi bi-folder2-open me-1"></i>{{ download_dir }}
+  </a>
+</nav>
+
+<!-- ═════════════════════════════════════  MAIN CONTENT  ════════════════════ -->
+<div class="container-fluid px-4 pt-3">
+
+  <!-- Breadcrumb -->
+  <nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+      {% for crumb in breadcrumbs %}
+        {% if loop.last %}
+          <li class="breadcrumb-item active" aria-current="page">
+            <i class="bi bi-folder2-open me-1 text-warning"></i>{{ crumb.name }}
+          </li>
+        {% else %}
+          <li class="breadcrumb-item">
+            <a href="/browse?path={{ crumb.path }}" class="text-decoration-none">
+              <i class="bi bi-folder me-1 text-secondary"></i>{{ crumb.name }}
+            </a>
+          </li>
+        {% endif %}
+      {% endfor %}
+    </ol>
+  </nav>
+
+  <!-- Error alert -->
+  {% if error %}
+  <div class="alert alert-danger d-flex align-items-center gap-2" role="alert">
+    <i class="bi bi-exclamation-triangle-fill"></i>
+    <div><strong>Connection error:</strong> {{ error }}</div>
+  </div>
+  {% endif %}
+
+  <!-- File table -->
+  <div class="table-responsive">
+    <table class="table table-hover table-sm file-table align-middle">
+      <thead class="table-dark sticky-top">
+        <tr>
+          <th style="width:2rem"></th>
+          <th>Name</th>
+          <th style="width:8rem">Size</th>
+          <th style="width:12rem">Modified</th>
+          <th style="width:9rem"></th>
+        </tr>
+      </thead>
+      <tbody>
+
+        <!-- Parent directory row -->
+        {% if parent is not none %}
+        <tr>
+          <td><i class="bi bi-arrow-up-circle text-secondary fs-5"></i></td>
+          <td colspan="3">
+            <a href="/browse?path={{ parent }}" class="folder-link text-decoration-none">
+              .. (go up)
+            </a>
+          </td>
+          <td></td>
+        </tr>
+        {% endif %}
+
+        <!-- Directory and file rows -->
+        {% for entry in entries %}
+        <tr class="entry-row">
+
+          <!-- Icon column -->
+          <td class="text-center">
+            {% if entry.is_dir %}
+              <i class="bi bi-folder-fill text-warning fs-5"></i>
+            {% else %}
+              {% set ext = entry.name.rsplit('.', 1)[-1].lower() %}
+              {% if ext in ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'm4v', 'webm'] %}
+                <i class="bi bi-film text-danger fs-5"></i>
+              {% elif ext in ['mp3', 'flac', 'aac', 'ogg', 'wav', 'm4a'] %}
+                <i class="bi bi-music-note-beamed text-info fs-5"></i>
+              {% elif ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg'] %}
+                <i class="bi bi-image text-success fs-5"></i>
+              {% elif ext in ['zip', 'rar', '7z', 'tar', 'gz', 'bz2'] %}
+                <i class="bi bi-file-zip text-warning fs-5"></i>
+              {% elif ext in ['pdf'] %}
+                <i class="bi bi-file-pdf text-danger fs-5"></i>
+              {% elif ext in ['doc', 'docx', 'odt'] %}
+                <i class="bi bi-file-word text-primary fs-5"></i>
+              {% elif ext in ['iso', 'img'] %}
+                <i class="bi bi-disc text-secondary fs-5"></i>
+              {% else %}
+                <i class="bi bi-file-earmark text-secondary fs-5"></i>
+              {% endif %}
+            {% endif %}
+          </td>
+
+          <!-- Name column -->
+          <td class="file-name-cell">
+            {% if entry.is_dir %}
+              <a href="/browse?path={{ entry.path }}" class="folder-link text-decoration-none">
+                {{ entry.name }}
+              </a>
+            {% else %}
+              <span title="{{ entry.name }}">{{ entry.name }}</span>
+            {% endif %}
+          </td>
+
+          <td class="text-secondary">{{ entry.size }}</td>
+          <td class="text-secondary small">{{ entry.modified }}</td>
+
+          <!-- Download button (files and folders) -->
+          <td class="text-end">
+            {% if entry.is_dir %}
+            <button class="btn btn-sm btn-outline-violet dl-btn"
+                    style="border-color:#9c6ef3;color:#9c6ef3"
+                    data-path="{{ entry.path }}"
+                    data-name="{{ entry.name }}"
+                    data-type="folder"
+                    onclick="startDownload(this)">
+              <i class="bi bi-folder-symlink me-1"></i>Download
+            </button>
+            {% else %}
+            <button class="btn btn-sm btn-outline-info dl-btn"
+                    data-path="{{ entry.path }}"
+                    data-name="{{ entry.name }}"
+                    data-type="file"
+                    onclick="startDownload(this)">
+              <i class="bi bi-download me-1"></i>Download
+            </button>
+            {% endif %}
+          </td>
+
+        </tr>
+        {% endfor %}
+
+        {% if not entries and not error %}
+        <tr>
+          <td colspan="5" class="text-center text-secondary py-4">
+            <i class="bi bi-folder-x fs-2 d-block mb-2"></i>
+            Empty directory
+          </td>
+        </tr>
+        {% endif %}
+
+      </tbody>
+    </table>
+  </div><!-- /table-responsive -->
+</div><!-- /container-fluid -->
+
+
+<!-- ═══════════════════════════════  DOWNLOADS PANEL  ══════════════════════ -->
+<div id="downloads-panel">
+
+  <div id="panel-header" onclick="togglePanel()">
+    <span>
+      <i class="bi bi-download me-2 text-info"></i>
+      <strong>Downloads</strong>
+      <span id="active-count" class="badge bg-secondary ms-2">0 active</span>
+    </span>
+    <i id="panel-chevron" class="bi bi-chevron-up"></i>
+  </div>
+
+  <div id="jobs-container" class="px-3 py-2 d-flex flex-column gap-2">
+    <span class="text-secondary small" id="no-jobs-msg">
+      No downloads yet — click a Download button above.
+    </span>
+  </div>
+
+</div>
+
+
+<!-- Bootstrap JS bundle -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-YvpcrYf0tY3lHB60NNkmXc4s9bIOgUxi8T/jzmF+H20bu6tHV7bwPnFLnWh5q3E"
+        crossorigin="anonymous"></script>
+
+<script>
+// ── Configuration (mirrors server-side constants — informational only) ─────
+const SLEEP_SECS = {{ sleep_secs }};
+
+// ── State ──────────────────────────────────────────────────────────────────
+let panelCollapsed = false;
+const pollingJobs  = new Set();   // job IDs currently being polled
+
+// ── Panel collapse / expand ────────────────────────────────────────────────
+function togglePanel() {
+  panelCollapsed = !panelCollapsed;
+  document.getElementById('downloads-panel').classList.toggle('collapsed', panelCollapsed);
+  document.getElementById('panel-chevron').className =
+    panelCollapsed ? 'bi bi-chevron-down' : 'bi bi-chevron-up';
+}
+
+// ── Trigger a download ─────────────────────────────────────────────────────
+async function startDownload(btn) {
+  const path = btn.dataset.path;
+  const name = btn.dataset.name;
+  const type = btn.dataset.type || 'file';
+
+  btn.disabled    = true;
+  btn.innerHTML   = type === 'folder'
+    ? '<span class="spinner-border spinner-border-sm me-1"></span>Scanning…'
+    : '<span class="spinner-border spinner-border-sm me-1"></span>Queuing…';
+
+  const fd = new FormData();
+  fd.append('path', path);
+  fd.append('type', type);
+
+  try {
+    const resp = await fetch('/download', { method: 'POST', body: fd });
+    const data = await resp.json();
+
+    if (data.error) {
+      showBtnError(btn, data.error);
+      return;
+    }
+
+    btn.innerHTML = type === 'folder'
+      ? '<i class="bi bi-arrow-repeat me-1"></i>Downloading…'
+      : '<i class="bi bi-arrow-repeat me-1"></i>Downloading…';
+    btn.className = type === 'folder'
+      ? 'btn btn-sm dl-btn'
+      : 'btn btn-sm btn-outline-warning dl-btn';
+    if (type === 'folder') {
+      btn.style.borderColor = '#e0a800';
+      btn.style.color       = '#e0a800';
+    }
+
+    ensurePolling(data.job_id, btn);
+
+    // Expand the panel so the user can see progress
+    if (panelCollapsed) togglePanel();
+
+  } catch (err) {
+    showBtnError(btn, err.toString());
+  }
+}
+
+function showBtnError(btn, msg) {
+  btn.disabled  = false;
+  btn.innerHTML = '<i class="bi bi-exclamation-triangle me-1"></i>Error';
+  btn.className = 'btn btn-sm btn-outline-danger dl-btn';
+  btn.title     = msg;
+}
+
+// ── Polling ────────────────────────────────────────────────────────────────
+function ensurePolling(jobId, btn) {
+  if (pollingJobs.has(jobId)) return;
+  pollingJobs.add(jobId);
+  pollJob(jobId, btn);
+}
+
+async function pollJob(jobId, btn) {
+  try {
+    const resp = await fetch(`/status/${jobId}`);
+    if (!resp.ok) { pollingJobs.delete(jobId); return; }
+    const job = await resp.json();
+
+    renderJobCard(job);
+    updateActiveCount();
+
+    // Update the table button state
+    if (btn) syncBtn(btn, job);
+
+    // Keep polling if not terminal
+    if (!TERMINAL_STATUSES.has(job.status)) {
+      setTimeout(() => pollJob(jobId, btn), 3000);
+    } else {
+      pollingJobs.delete(jobId);
+    }
+  } catch (_) {
+    pollingJobs.delete(jobId);
+  }
+}
+
+function syncBtn(btn, job) {
+  if (job.status === 'complete') {
+    btn.disabled          = false;
+    btn.style.borderColor = '';
+    btn.style.color       = '';
+    btn.innerHTML = '<i class="bi bi-check-circle me-1"></i>Done';
+    btn.className = 'btn btn-sm btn-outline-success dl-btn';
+  } else if (job.status === 'error') {
+    btn.disabled          = false;
+    btn.style.borderColor = '';
+    btn.style.color       = '';
+    btn.innerHTML = '<i class="bi bi-exclamation-triangle me-1"></i>Failed';
+    btn.className = 'btn btn-sm btn-outline-danger dl-btn';
+    btn.title     = job.error || '';
+  } else if (job.status === 'cancelled') {
+    btn.disabled          = false;
+    btn.style.borderColor = '';
+    btn.style.color       = '';
+    btn.innerHTML = job.type === 'folder'
+      ? '<i class="bi bi-folder-symlink me-1"></i>Download'
+      : '<i class="bi bi-download me-1"></i>Download';
+    btn.className = job.type === 'folder'
+      ? 'btn btn-sm btn-outline-violet dl-btn'
+      : 'btn btn-sm btn-outline-info dl-btn';
+    if (job.type === 'folder') {
+      btn.style.borderColor = '#9c6ef3';
+      btn.style.color       = '#9c6ef3';
+    }
+  }
+}
+
+// ── Cancel a running download ───────────────────────────────────────────────
+async function cancelJob(jobId) {
+  const btn = document.getElementById(`cancel-btn-${jobId}`);
+  if (btn) {
+    btn.disabled  = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+  }
+  try {
+    await fetch(`/cancel/${jobId}`, { method: 'POST' });
+    // The poll loop will pick up the 'cancelled' status within a second
+  } catch (_) {
+    if (btn) {
+      btn.disabled  = false;
+      btn.innerHTML = '<i class="bi bi-x-lg"></i>';
+    }
+  }
+}
+
+// ── Job card rendering ─────────────────────────────────────────────────────
+const STATUS_META = {
+  starting:    { label: 'Starting',              badge: 'badge-starting'    },
+  scanning:    { label: 'Scanning…',             badge: 'badge-starting'    },
+  downloading: { label: 'Downloading',           badge: 'badge-downloading' },
+  pausing:     { label: `Cooldown ${SLEEP_SECS}s`, badge: 'badge-pausing'  },
+  retrying:    { label: 'Retrying…',             badge: 'badge-retrying'    },
+  complete:    { label: 'Complete',              badge: 'badge-complete'    },
+  error:       { label: 'Error',                 badge: 'badge-error'       },
+  cancelled:   { label: 'Cancelled',             badge: 'badge-cancelled'   },
+};
+
+const TERMINAL_STATUSES = new Set(['complete', 'error', 'cancelled']);
+
+function renderJobCard(job) {
+  const noMsg = document.getElementById('no-jobs-msg');
+  if (noMsg) noMsg.remove();
+
+  let card = document.getElementById(`job-${job.id}`);
+  if (!card) {
+    card = document.createElement('div');
+    card.id        = `job-${job.id}`;
+    card.className = 'job-card border border-secondary rounded p-2';
+    document.getElementById('jobs-container').prepend(card);
+  }
+
+  const meta       = STATUS_META[job.status] || { label: job.status, badge: 'badge-starting' };
+  const pct        = job.percent ?? 0;
+  const isTerminal = TERMINAL_STATUSES.has(job.status);
+  const barClass   = job.status === 'complete' ? 'bg-success' :
+                     job.status === 'error'    ? 'bg-danger'  :
+                     job.status === 'pausing'  ? 'bg-warning' : '';
+
+  // ── Folder-specific subtitle line ──────────────────────────────────────
+  let subtitle = '';
+  if (job.type === 'folder') {
+    const icon = '<i class="bi bi-folder-fill text-warning me-1"></i>';
+    if (job.status === 'scanning') {
+      subtitle = `${icon}Scanning remote directory…`;
+    } else if (job.total_files !== null && job.total_files > 0) {
+      const fileCounter = `File ${job.completed_files + (isTerminal ? 0 : 1)} / ${job.total_files}`;
+      const curFile     = job.current_file
+        ? `&nbsp;·&nbsp;<span class="text-light">${job.current_file}</span>`
+        : '';
+      subtitle = `${icon}${fileCounter}${curFile}`;
+    } else if (job.total_files === 0) {
+      subtitle = `${icon}Empty folder`;
+    }
+  }
+
+  // ── Right-side detail: chunk counter for files, file counter for folders ─
+  let rightDetail = '';
+  if (job.type === 'folder') {
+    rightDetail = isTerminal ? '' : `${job.completed_files}/${job.total_files ?? '?'} files`;
+  } else {
+    rightDetail = `chunk ${job.chunks_done}${isTerminal ? '' : ' …'}`;
+  }
+
+  const cancelBtn = isTerminal ? '' : `
+    <button id="cancel-btn-${job.id}"
+            class="btn btn-sm btn-outline-danger py-0 px-1 flex-shrink-0"
+            style="font-size:0.72rem;line-height:1.4"
+            title="Cancel download"
+            onclick="cancelJob('${job.id}')">
+      <i class="bi bi-x-lg"></i>
+    </button>`;
+
+  card.innerHTML = `
+    <div class="d-flex justify-content-between align-items-start gap-2 mb-1">
+      <span class="job-fname text-light" title="${job.filename}">
+        ${job.type === 'folder' ? '<i class="bi bi-folder-fill text-warning me-1"></i>' : ''}${job.filename}
+      </span>
+      <div class="d-flex align-items-center gap-1">
+        <span class="badge ${meta.badge}">${meta.label}</span>
+        ${cancelBtn}
+      </div>
+    </div>
+    ${subtitle ? `<div class="text-secondary mb-1" style="font-size:0.76rem">${subtitle}</div>` : ''}
+    <div class="progress mb-1" style="height:5px">
+      <div class="progress-bar ${barClass}" style="width:${pct}%"
+           role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"></div>
+    </div>
+    <div class="d-flex justify-content-between text-secondary" style="font-size:0.76rem">
+      <span>${job.downloaded_human} / ${job.total_human}</span>
+      <span>${pct}%${rightDetail ? ' &nbsp;·&nbsp; ' + rightDetail : ''}</span>
+    </div>
+    ${job.error ? `<div class="text-danger mt-1" style="font-size:0.75rem">
+                     <i class="bi bi-exclamation-circle me-1"></i>${job.error}</div>` : ''}
+    ${job.status === 'complete'
+       ? `<div class="text-success mt-1" style="font-size:0.75rem">
+            <i class="bi bi-check2-circle me-1"></i>Saved to: ${job.local_path}</div>`
+       : ''}
+    ${job.status === 'cancelled'
+       ? `<div class="text-secondary mt-1" style="font-size:0.75rem">
+            <i class="bi bi-slash-circle me-1"></i>Cancelled — partial file kept at: ${job.local_path}</div>`
+       : ''}
+  `;
+}
+
+function updateActiveCount() {
+  document.getElementById('active-count').textContent =
+    `${pollingJobs.size} active`;
+}
+
+// ── On page load: restore any in-progress jobs from the server ────────────
+window.addEventListener('load', async () => {
+  try {
+    const resp = await fetch('/jobs');
+    const jobs = await resp.json();
+    for (const job of jobs) {
+      renderJobCard(job);
+      if (!TERMINAL_STATUSES.has(job.status)) {
+        // Find the matching button in the table (may not exist if path changed)
+        const btn = document.querySelector(`button[data-path="${job.remote_path}"]`);
+        ensurePolling(job.id, btn);
+      }
+    }
+    updateActiveCount();
+    if (jobs.length && panelCollapsed) togglePanel();
+  } catch (_) { /* server not ready yet */ }
+});
+</script>
+
+</body>
+</html>
