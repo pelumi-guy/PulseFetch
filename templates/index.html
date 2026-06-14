@@ -49,6 +49,7 @@
     .badge-complete    { background-color: #198754; }
     .badge-error       { background-color: #dc3545; }
     .badge-cancelled   { background-color: #6c757d; }
+    .badge-uploading   { background-color: #0d6efd; }
 
     /* ── Misc ────────────────────────────────────────────────────────── */
     .navbar-brand span { font-size: 0.75rem; opacity: 0.7; }
@@ -96,6 +97,14 @@
       {% endfor %}
     </ol>
   </nav>
+
+  <!-- Toolbar -->
+  <div class="d-flex justify-content-end mb-2">
+    <button class="btn btn-sm btn-outline-primary"
+            data-bs-toggle="modal" data-bs-target="#uploadModal">
+      <i class="bi bi-cloud-upload me-1"></i>Upload here
+    </button>
+  </div>
 
   <!-- Error alert -->
   {% if error %}
@@ -221,8 +230,8 @@
 
   <div id="panel-header" onclick="togglePanel()">
     <span>
-      <i class="bi bi-download me-2 text-info"></i>
-      <strong>Downloads</strong>
+      <i class="bi bi-arrow-left-right me-2 text-info"></i>
+      <strong>Transfers</strong>
       <span id="active-count" class="badge bg-secondary ms-2">0 active</span>
     </span>
     <i id="panel-chevron" class="bi bi-chevron-up"></i>
@@ -236,6 +245,42 @@
 
 </div>
 
+
+<!-- ══════════════════════════════════  UPLOAD MODAL  ══════════════════════ -->
+<div class="modal fade" id="uploadModal" tabindex="-1" aria-labelledby="uploadModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content bg-dark border-secondary">
+      <div class="modal-header border-secondary">
+        <h5 class="modal-title" id="uploadModalLabel">
+          <i class="bi bi-cloud-upload me-2 text-primary"></i>Upload File
+        </h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label text-secondary small">Uploading to</label>
+          <input type="text" class="form-control form-control-sm bg-secondary bg-opacity-25 text-light border-secondary"
+                 value="{{ current_path }}" readonly>
+        </div>
+        <div class="mb-1">
+          <label for="uploadLocalPath" class="form-label">Local file path</label>
+          <input type="text" class="form-control bg-dark text-light border-secondary"
+                 id="uploadLocalPath"
+                 placeholder="e.g. C:\Users\You\Videos\movie.mkv"
+                 oninput="this.classList.remove('is-invalid')">
+          <div class="invalid-feedback">Please enter a valid local file path.</div>
+          <div class="form-text text-secondary">Full path to the file on this computer. The upload is paced — the same chunk + cooldown approach used for downloads.</div>
+        </div>
+      </div>
+      <div class="modal-footer border-secondary">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="startUploadBtn" onclick="startUpload()">
+          <i class="bi bi-cloud-upload me-1"></i>Start Upload
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <!-- Bootstrap JS bundle -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
@@ -394,6 +439,7 @@ const STATUS_META = {
   starting:    { label: 'Starting',              badge: 'badge-starting'    },
   scanning:    { label: 'Scanning…',             badge: 'badge-starting'    },
   downloading: { label: 'Downloading',           badge: 'badge-downloading' },
+  uploading:   { label: 'Uploading',             badge: 'badge-uploading'   },
   pausing:     { label: `Cooldown ${SLEEP_SECS}s`, badge: 'badge-pausing'  },
   retrying:    { label: 'Retrying…',             badge: 'badge-retrying'    },
   complete:    { label: 'Complete',              badge: 'badge-complete'    },
@@ -439,7 +485,7 @@ function renderJobCard(job) {
     }
   }
 
-  // ── Right-side detail: chunk counter for files, file counter for folders ─
+  // ── Right-side detail: chunk counter for files/uploads, file counter for folders ─
   let rightDetail = '';
   if (job.type === 'folder') {
     rightDetail = isTerminal ? '' : `${job.completed_files}/${job.total_files ?? '?'} files`;
@@ -456,10 +502,18 @@ function renderJobCard(job) {
       <i class="bi bi-x-lg"></i>
     </button>`;
 
+  const jobIcon = job.type === 'folder'
+    ? '<i class="bi bi-folder-fill text-warning me-1"></i>'
+    : job.type === 'upload'
+      ? '<i class="bi bi-cloud-upload text-primary me-1"></i>'
+      : '';
+
+  const transferLabel = job.type === 'upload' ? 'Uploaded' : 'Downloaded';
+
   card.innerHTML = `
     <div class="d-flex justify-content-between align-items-start gap-2 mb-1">
       <span class="job-fname text-light" title="${job.filename}">
-        ${job.type === 'folder' ? '<i class="bi bi-folder-fill text-warning me-1"></i>' : ''}${job.filename}
+        ${jobIcon}${job.filename}
       </span>
       <div class="d-flex align-items-center gap-1">
         <span class="badge ${meta.badge}">${meta.label}</span>
@@ -472,18 +526,24 @@ function renderJobCard(job) {
            role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"></div>
     </div>
     <div class="d-flex justify-content-between text-secondary" style="font-size:0.76rem">
-      <span>${job.downloaded_human} / ${job.total_human}</span>
+      <span>${transferLabel}: ${job.downloaded_human} / ${job.total_human}</span>
       <span>${pct}%${rightDetail ? ' &nbsp;·&nbsp; ' + rightDetail : ''}</span>
     </div>
     ${job.error ? `<div class="text-danger mt-1" style="font-size:0.75rem">
                      <i class="bi bi-exclamation-circle me-1"></i>${job.error}</div>` : ''}
     ${job.status === 'complete'
-       ? `<div class="text-success mt-1" style="font-size:0.75rem">
-            <i class="bi bi-check2-circle me-1"></i>Saved to: ${job.local_path}</div>`
+       ? job.type === 'upload'
+         ? `<div class="text-success mt-1" style="font-size:0.75rem">
+              <i class="bi bi-check2-circle me-1"></i>Uploaded to: ${job.remote_path}</div>`
+         : `<div class="text-success mt-1" style="font-size:0.75rem">
+              <i class="bi bi-check2-circle me-1"></i>Saved to: ${job.local_path}</div>`
        : ''}
     ${job.status === 'cancelled'
-       ? `<div class="text-secondary mt-1" style="font-size:0.75rem">
-            <i class="bi bi-slash-circle me-1"></i>Cancelled — partial file kept at: ${job.local_path}</div>`
+       ? job.type === 'upload'
+         ? `<div class="text-secondary mt-1" style="font-size:0.75rem">
+              <i class="bi bi-slash-circle me-1"></i>Cancelled — partial upload at: ${job.remote_path}</div>`
+         : `<div class="text-secondary mt-1" style="font-size:0.75rem">
+              <i class="bi bi-slash-circle me-1"></i>Cancelled — partial file kept at: ${job.local_path}</div>`
        : ''}
   `;
 }
@@ -492,6 +552,60 @@ function updateActiveCount() {
   document.getElementById('active-count').textContent =
     `${pollingJobs.size} active`;
 }
+
+// ── Trigger an upload ──────────────────────────────────────────────────────
+async function startUpload() {
+  const pathInput = document.getElementById('uploadLocalPath');
+  const localPath = pathInput.value.trim();
+  if (!localPath) {
+    pathInput.classList.add('is-invalid');
+    return;
+  }
+
+  const btn = document.getElementById('startUploadBtn');
+  btn.disabled  = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Starting…';
+
+  const fd = new FormData();
+  fd.append('local_path', localPath);
+  fd.append('remote_dir', '{{ current_path }}');
+
+  try {
+    const resp = await fetch('/upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+
+    btn.disabled  = false;
+    btn.innerHTML = '<i class="bi bi-cloud-upload me-1"></i>Start Upload';
+
+    if (data.error) {
+      pathInput.classList.add('is-invalid');
+      pathInput.nextElementSibling.textContent = data.error;
+      return;
+    }
+
+    bootstrap.Modal.getInstance(document.getElementById('uploadModal')).hide();
+    pathInput.value = '';
+
+    ensurePolling(data.job_id, null);
+    if (panelCollapsed) togglePanel();
+
+  } catch (err) {
+    btn.disabled  = false;
+    btn.innerHTML = '<i class="bi bi-cloud-upload me-1"></i>Start Upload';
+    pathInput.classList.add('is-invalid');
+    pathInput.nextElementSibling.textContent = err.toString();
+  }
+}
+
+// ── Reset upload modal when closed ────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('uploadModal')
+    .addEventListener('hidden.bs.modal', () => {
+      const inp = document.getElementById('uploadLocalPath');
+      inp.value = '';
+      inp.classList.remove('is-invalid');
+    });
+});
 
 // ── On page load: restore any in-progress jobs from the server ────────────
 window.addEventListener('load', async () => {

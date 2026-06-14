@@ -259,6 +259,53 @@ def start_download():
     return jsonify({"job_id": job_id})
 
 
+@app.route("/upload", methods=["POST"])
+def start_upload():
+    local_path  = request.form.get("local_path", "").strip()
+    remote_dir  = request.form.get("remote_dir", "").strip()
+
+    if not local_path or not os.path.isfile(local_path):
+        return jsonify({"error": "Local file not found — check the path and try again"}), 400
+    if not remote_dir:
+        return jsonify({"error": "Remote directory is required"}), 400
+
+    filename    = os.path.basename(local_path)
+    remote_path = remote_dir.rstrip("/") + "/" + filename
+
+    # Prevent duplicate in-progress uploads of the same remote path
+    with jobs_lock:
+        for j in download_jobs.values():
+            if (j["remote_path"] == remote_path
+                    and j["type"] == "upload"
+                    and j["status"] not in ("complete", "error", "cancelled")):
+                return jsonify({"job_id": j["id"], "existing": True})
+
+    job_id = str(uuid.uuid4())
+    job = {
+        "id":               job_id,
+        "type":             "upload",
+        "filename":         filename,
+        "local_path":       local_path,
+        "remote_path":      remote_path,
+        "total_bytes":      os.path.getsize(local_path),
+        "downloaded_bytes": 0,   # bytes transferred (uploaded so far)
+        "chunks_done":      0,
+        "total_files":      None,
+        "completed_files":  0,
+        "current_file":     None,
+        "status":           "starting",
+        "error":            None,
+        "started_at":       datetime.now().strftime("%H:%M:%S"),
+    }
+
+    with jobs_lock:
+        download_jobs[job_id] = job
+
+    cancel_events[job_id] = threading.Event()
+    threading.Thread(target=_paced_upload, args=(job_id,), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/cancel/<job_id>", methods=["POST"])
 def cancel_download(job_id: str):
     with jobs_lock:
@@ -622,6 +669,138 @@ def _folder_download(job_id: str) -> None:
     with jobs_lock:
         job["status"]       = "complete"
         job["current_file"] = None
+    cancel_events.pop(job_id, None)
+
+
+# ─── Paced upload engine ──────────────────────────────────────────────────────
+
+def _paced_upload(job_id: str) -> None:
+    """
+    Background thread that uploads a local file to the SFTP server in discrete
+    chunks, closing the connection completely after each chunk and pausing for
+    SLEEP_BETWEEN_CHUNKS seconds before the next one.
+
+    Resume logic
+    ─────────────
+    On first run: stat the remote path.  If the remote file already has N bytes
+    (from a previously interrupted upload), skip the first N bytes of the local
+    file and open the remote file in append mode ("ab") so new chunks are written
+    immediately after the existing data.  If offset == 0 (fresh upload), the
+    remote file is created/truncated via "wb".
+
+    On error: re-stat the remote file to get the actual committed byte count —
+    this is the ground truth after any partial write — then re-seek the local
+    file handle to that position and retry.
+
+    The pacing (fresh connection + sleep between chunks) is identical to the
+    download engine so the router gets the same breathing room in both directions.
+    """
+    job         = download_jobs[job_id]
+    local_path  = job["local_path"]
+    remote_path = job["remote_path"]
+    total_size  = job["total_bytes"]
+
+    sftp = transport = None
+
+    # ── Step 1: derive starting byte offset (resume support) ─────────────
+    try:
+        sftp, transport = sftp_connect()
+        try:
+            offset = sftp.stat(remote_path).st_size
+        except IOError:
+            offset = 0   # file does not yet exist on the remote
+        sftp_close(sftp, transport)
+        sftp = transport = None
+    except Exception as exc:
+        with jobs_lock:
+            job["status"] = "error"
+            job["error"]  = f"Cannot connect to SFTP: {exc}"
+        return
+
+    with jobs_lock:
+        job["downloaded_bytes"] = offset
+        job["chunks_done"]      = offset // CHUNK_SIZE
+        job["status"]           = "uploading"
+
+    # ── Step 2: chunk loop ────────────────────────────────────────────────
+    with open(local_path, "rb") as local_fh:
+        local_fh.seek(offset)
+
+        while offset < total_size:
+
+            if cancel_events.get(job_id, threading.Event()).is_set():
+                with jobs_lock:
+                    job["status"] = "cancelled"
+                cancel_events.pop(job_id, None)
+                return
+
+            try:
+                chunk = local_fh.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                # Fresh connection per chunk — router releases all state between bursts
+                sftp, transport = sftp_connect()
+                # "wb" on first chunk (creates / truncates); "ab" on resume chunks
+                # so we always append exactly at the end of committed remote data.
+                mode = "wb" if offset == 0 else "ab"
+                remote_fh = sftp.open(remote_path, mode)
+                remote_fh.write(chunk)
+                remote_fh.close()
+                sftp_close(sftp, transport)
+                sftp = transport = None
+
+                offset += len(chunk)
+                with jobs_lock:
+                    job["downloaded_bytes"] = offset
+                    job["chunks_done"]      = offset // CHUNK_SIZE
+                    job["error"]            = None
+
+                if offset < total_size:
+                    with jobs_lock:
+                        job["status"] = "pausing"
+                    if _cancellable_sleep(job_id, SLEEP_BETWEEN_CHUNKS):
+                        with jobs_lock:
+                            job["status"] = "cancelled"
+                        cancel_events.pop(job_id, None)
+                        return
+                    with jobs_lock:
+                        job["status"] = "uploading"
+
+            except Exception as exc:
+                sftp_close(sftp, transport)
+                sftp = transport = None
+
+                with jobs_lock:
+                    job["status"] = "retrying"
+                    job["error"]  = f"{exc}  — retrying in {RETRY_WAIT_SECS}s"
+
+                if _cancellable_sleep(job_id, RETRY_WAIT_SECS):
+                    with jobs_lock:
+                        job["status"] = "cancelled"
+                    cancel_events.pop(job_id, None)
+                    return
+
+                # Re-derive from remote stat — the only reliable ground truth
+                # for how many bytes actually landed on the server.
+                try:
+                    sftp, transport = sftp_connect()
+                    try:
+                        offset = sftp.stat(remote_path).st_size
+                    except IOError:
+                        offset = 0
+                    sftp_close(sftp, transport)
+                    sftp = transport = None
+                except Exception:
+                    pass  # keep previous offset if we can't reconnect right now
+
+                local_fh.seek(offset)
+                with jobs_lock:
+                    job["downloaded_bytes"] = offset
+                    job["status"]           = "uploading"
+
+    with jobs_lock:
+        job["status"] = "complete"
     cancel_events.pop(job_id, None)
 
 
