@@ -100,8 +100,7 @@
 
   <!-- Toolbar -->
   <div class="d-flex justify-content-end mb-2">
-    <button class="btn btn-sm btn-outline-primary"
-            data-bs-toggle="modal" data-bs-target="#uploadModal">
+    <button class="btn btn-sm btn-outline-primary" onclick="openUploadModal()">
       <i class="bi bi-cloud-upload me-1"></i>Upload here
     </button>
   </div>
@@ -254,7 +253,7 @@
         <h5 class="modal-title" id="uploadModalLabel">
           <i class="bi bi-cloud-upload me-2 text-primary"></i>Upload File
         </h5>
-        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        <button type="button" class="btn-close btn-close-white" onclick="closeUploadModal()"></button>
       </div>
       <div class="modal-body">
         <div class="mb-3">
@@ -273,7 +272,7 @@
         </div>
       </div>
       <div class="modal-footer border-secondary">
-        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-secondary" onclick="closeUploadModal()">Cancel</button>
         <button type="button" class="btn btn-primary" id="startUploadBtn" onclick="startUpload()">
           <i class="bi bi-cloud-upload me-1"></i>Start Upload
         </button>
@@ -583,8 +582,7 @@ async function startUpload() {
       return;
     }
 
-    bootstrap.Modal.getInstance(document.getElementById('uploadModal')).hide();
-    pathInput.value = '';
+    closeUploadModal();
 
     ensurePolling(data.job_id, null);
     if (panelCollapsed) togglePanel();
@@ -597,15 +595,22 @@ async function startUpload() {
   }
 }
 
-// ── Reset upload modal when closed ────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('uploadModal')
-    .addEventListener('hidden.bs.modal', () => {
-      const inp = document.getElementById('uploadLocalPath');
-      inp.value = '';
-      inp.classList.remove('is-invalid');
-    });
-});
+// ── Upload modal helpers ────────────────────────────────────────────────────
+// Using an explicit Bootstrap Modal instance instead of data-bs-toggle so the
+// modal opens reliably regardless of browser-extension event interception.
+const _uploadModalEl = document.getElementById('uploadModal');
+const _uploadModal   = new bootstrap.Modal(_uploadModalEl);
+
+function openUploadModal() {
+  _uploadModal.show();
+}
+
+function closeUploadModal() {
+  _uploadModal.hide();
+  const inp = document.getElementById('uploadLocalPath');
+  inp.value = '';
+  inp.classList.remove('is-invalid');
+}
 
 // ── On page load: restore any in-progress jobs from the server ────────────
 window.addEventListener('load', async () => {
